@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help up down restart ps logs build clean topics psql redis-cli format lint test dlq-replay dlq-replay-dry
+.PHONY: help up down restart ps logs build clean topics psql redis-cli format lint test dlq-replay dlq-replay-dry load load-200rps load-1k
 
 help:
 	@echo ""
@@ -19,6 +19,9 @@ help:
 	@echo "  make test            Run tests (pytest)"
 	@echo "  make dlq-replay      Replay DLQ messages back to main topic"
 	@echo "  make dlq-replay-dry  Dry-run DLQ replay"
+	@echo "  make load            Run k6 load test (50 rps, 30s)"
+	@echo "  make load-200rps     Run k6 load test (200 rps, 30s)"
+	@echo "  make load-1k         Run k6 load test (1000 rps, 30s)"
 	@echo "  make clean           Remove volumes (DANGER)"
 	@echo ""
 
@@ -68,6 +71,15 @@ dlq-replay:
 
 dlq-replay-dry:
 	docker compose run --rm processor-worker python -m app.dlq_replay --from-beginning --dry-run --max-messages=50
+
+load:
+	docker compose run --rm -e RATE=50 -e DURATION=30s k6 run /scripts/k6-ingest.js
+
+load-200rps:
+	docker compose run --rm -e RATE=200 -e DURATION=30s k6 run /scripts/k6-ingest.js
+
+load-1k:
+	docker compose run --rm -e RATE=1000 -e DURATION=30s -e VUS=200 -e MAX_VUS=400 k6 run /scripts/k6-ingest.js
 
 clean:
 	docker compose down -v
