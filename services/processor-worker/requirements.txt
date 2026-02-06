@@ -1,2 +1,3 @@
 aiokafka
 asyncpg
+prometheus-client
