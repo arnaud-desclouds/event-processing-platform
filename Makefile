@@ -1,23 +1,25 @@
 SHELL := /bin/bash
 
-.PHONY: help up down restart ps logs build clean topics psql redis-cli format lint test
+.PHONY: help up down restart ps logs build clean topics psql redis-cli format lint test dlq-replay dlq-replay-dry
 
 help:
 	@echo ""
 	@echo "Targets:"
-	@echo "  make up           Start the full stack"
-	@echo "  make down         Stop the stack"
-	@echo "  make restart      Restart the stack"
-	@echo "  make ps           Show container status"
-	@echo "  make logs         Tail all logs"
-	@echo "  make build        Build app images"
-	@echo "  make topics       Create default topics"
-	@echo "  make psql         Open psql shell"
-	@echo "  make redis-cli    Open redis-cli"
-	@echo "  make format       Format Python code (ruff)"
-	@echo "  make lint         Lint Python code (ruff)"
-	@echo "  make test         Run tests (pytest)"
-	@echo "  make clean        Remove volumes (DANGER)"
+	@echo "  make up              Start the full stack"
+	@echo "  make down            Stop the stack"
+	@echo "  make restart         Restart the stack"
+	@echo "  make ps              Show container status"
+	@echo "  make logs            Tail all logs"
+	@echo "  make build           Build app images"
+	@echo "  make topics          Create default topics"
+	@echo "  make psql            Open psql shell"
+	@echo "  make redis-cli       Open redis-cli"
+	@echo "  make format          Format Python code (ruff)"
+	@echo "  make lint            Lint Python code (ruff)"
+	@echo "  make test            Run tests (pytest)"
+	@echo "  make dlq-replay      Replay DLQ messages back to main topic"
+	@echo "  make dlq-replay-dry  Dry-run DLQ replay"
+	@echo "  make clean           Remove volumes (DANGER)"
 	@echo ""
 
 up:
@@ -60,6 +62,12 @@ lint:
 
 test:
 	pytest
+
+dlq-replay:
+	docker compose run --rm processor-worker python -m app.dlq_replay --from-beginning --commit-offsets
+
+dlq-replay-dry:
+	docker compose run --rm processor-worker python -m app.dlq_replay --from-beginning --dry-run --max-messages=50
 
 clean:
 	docker compose down -v
