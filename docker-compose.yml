@@ -126,6 +126,7 @@ services:
       - "16686:16686" # UI
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      COLLECTOR_ZIPKIN_HOST_PORT: "0.0.0.0:9411"
 
   prometheus:
     image: prom/prometheus:latest
