@@ -2,11 +2,17 @@ import asyncio
 import json
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from prometheus_client import Counter, Histogram, start_http_server
+
+from opentelemetry import propagate, trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 BROKERS = os.getenv("REDPANDA_BROKERS", "redpanda:9092")
 TOPIC = os.getenv("EVENTS_TOPIC", "events.raw")
@@ -17,6 +23,9 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "events")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "events_user")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "events_password")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "processor-worker")
 
 METRICS_PORT = int(os.getenv("WORKER_METRICS_PORT", "8000"))
 
@@ -62,8 +71,28 @@ DB_RECONNECTS_TOTAL = Counter(
 )
 
 
+def _setup_tracing() -> None:
+    resource = Resource.create({"service.name": SERVICE_NAME})
+    provider = TracerProvider(resource=resource)
+    exporter = OTLPSpanExporter(endpoint=OTEL_EXPORTER_OTLP_ENDPOINT, insecure=True)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+
+
 def _encode(obj: Dict[str, Any]) -> bytes:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _extract_trace_carrier(headers: Optional[list[Tuple[str, bytes]]]) -> Dict[str, str]:
+    carrier: Dict[str, str] = {}
+    if not headers:
+        return carrier
+    for k, v in headers:
+        try:
+            carrier[k] = v.decode("utf-8")
+        except Exception:
+            continue
+    return carrier
 
 
 async def _connect_db_with_retries() -> asyncpg.Connection:
@@ -85,10 +114,7 @@ async def _connect_db_with_retries() -> asyncpg.Connection:
             if attempt > DB_CONNECT_MAX_RETRIES:
                 raise RuntimeError(f"failed to connect to postgres after {DB_CONNECT_MAX_RETRIES} retries") from e
 
-            backoff = min(
-                DB_CONNECT_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)),
-                DB_CONNECT_MAX_BACKOFF_SECONDS,
-                )
+            backoff = min(DB_CONNECT_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)), DB_CONNECT_MAX_BACKOFF_SECONDS)
             print(f"db_connect_failed attempt={attempt} backoff={backoff:.2f}s err={type(e).__name__}")
             await asyncio.sleep(backoff)
 
@@ -119,16 +145,15 @@ async def _insert_event(conn: asyncpg.Connection, event: Dict[str, Any]) -> None
 
 
 async def _send_to_dlq(producer: AIOKafkaProducer, event: Dict[str, Any], reason: str) -> None:
-    dlq_event = {
-        "failed_event": event,
-        "failed_at": time.time(),
-        "reason": reason,
-    }
+    dlq_event = {"failed_event": event, "failed_at": time.time(), "reason": reason}
     await producer.send_and_wait(DLQ_TOPIC, _encode(dlq_event))
     EVENTS_SENT_TO_DLQ_TOTAL.inc()
 
 
 async def main():
+    _setup_tracing()
+    tracer = trace.get_tracer(__name__)
+
     start_http_server(METRICS_PORT)
     print(f"metrics server listening on :{METRICS_PORT}")
 
@@ -154,71 +179,80 @@ async def main():
         async for msg in consumer:
             start = time.perf_counter()
 
-            try:
-                event = json.loads(msg.value.decode("utf-8"))
-            except Exception:
-                EVENTS_FAILED_TOTAL.labels(reason="invalid_json").inc()
-                raw = {
-                    "raw": msg.value.decode("utf-8", errors="replace"),
-                    "reason": "invalid_json",
-                }
-                await dlq_producer.send_and_wait(DLQ_TOPIC, _encode(raw))
-                EVENTS_SENT_TO_DLQ_TOTAL.inc()
-                continue
+            carrier = _extract_trace_carrier(msg.headers)
+            parent_ctx = propagate.extract(carrier)
 
-            reason = "unknown"
-            attempt = 0
-
-            while True:
-                # reconnect if conn is missing/closed
-                if conn is None or conn.is_closed():
-                    DB_RECONNECTS_TOTAL.inc()
-                    conn = await _connect_db_with_retries()
-                    await _ensure_schema(conn)
-
+            with tracer.start_as_current_span("process_event", context=parent_ctx) as span:
                 try:
-                    await asyncio.wait_for(_insert_event(conn, event), timeout=DB_WRITE_TIMEOUT_SECONDS)
-
-                    EVENTS_PROCESSED_TOTAL.labels(
-                        event_type=event.get("type", "unknown"),
-                        source=event.get("source", "unknown"),
-                    ).inc()
-                    EVENT_PROCESSING_DURATION_SECONDS.observe(time.perf_counter() - start)
-
-                    print(
-                        f"processed event_id={event.get('event_id')} "
-                        f"type={event.get('type')} "
-                        f"source={event.get('source')}"
-                    )
-                    break
-
-                except asyncio.TimeoutError:
-                    reason = "db_timeout"
-                except (asyncpg.PostgresError, OSError) as e:
-                    # Likely connection-level issue; force reconnect next loop
-                    reason = "db_error"
-                    print(f"db_write_error err={type(e).__name__}")
-                    try:
-                        await conn.close()
-                    except Exception:
-                        pass
-                    conn = None
+                    event = json.loads(msg.value.decode("utf-8"))
                 except Exception:
-                    reason = "db_error"
+                    EVENTS_FAILED_TOTAL.labels(reason="invalid_json").inc()
+                    span.set_attribute("error", True)
+                    span.set_attribute("failure.reason", "invalid_json")
 
-                if attempt >= MAX_RETRIES:
-                    EVENTS_FAILED_TOTAL.labels(reason=reason).inc()
-                    await _send_to_dlq(dlq_producer, event, reason=reason)
-                    print(
-                        f"sent_to_dlq event_id={event.get('event_id')} "
-                        f"reason={reason} attempts={attempt}"
-                    )
-                    break
+                    raw = {"raw": msg.value.decode("utf-8", errors="replace"), "reason": "invalid_json"}
+                    await dlq_producer.send_and_wait(DLQ_TOPIC, _encode(raw))
+                    EVENTS_SENT_TO_DLQ_TOTAL.inc()
+                    continue
 
-                attempt += 1
-                EVENT_RETRIES_TOTAL.inc()
-                backoff = min(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)), MAX_BACKOFF_SECONDS)
-                await asyncio.sleep(backoff)
+                span.set_attribute("event.id", event.get("event_id"))
+                span.set_attribute("event.type", event.get("type"))
+                span.set_attribute("event.source", event.get("source"))
+
+                reason = "unknown"
+                attempt = 0
+
+                while True:
+                    if conn is None or conn.is_closed():
+                        DB_RECONNECTS_TOTAL.inc()
+                        conn = await _connect_db_with_retries()
+                        await _ensure_schema(conn)
+
+                    try:
+                        with tracer.start_as_current_span("db_insert"):
+                            await asyncio.wait_for(_insert_event(conn, event), timeout=DB_WRITE_TIMEOUT_SECONDS)
+
+                        EVENTS_PROCESSED_TOTAL.labels(
+                            event_type=event.get("type", "unknown"),
+                            source=event.get("source", "unknown"),
+                        ).inc()
+                        EVENT_PROCESSING_DURATION_SECONDS.observe(time.perf_counter() - start)
+
+                        span.set_attribute("processing.duration_ms", (time.perf_counter() - start) * 1000.0)
+                        print(
+                            f"processed event_id={event.get('event_id')} "
+                            f"type={event.get('type')} "
+                            f"source={event.get('source')}"
+                        )
+                        break
+
+                    except asyncio.TimeoutError:
+                        reason = "db_timeout"
+                    except (asyncpg.PostgresError, OSError) as e:
+                        reason = "db_error"
+                        span.set_attribute("db.error_type", type(e).__name__)
+                        try:
+                            await conn.close()
+                        except Exception:
+                            pass
+                        conn = None
+                    except Exception as e:
+                        reason = "db_error"
+                        span.set_attribute("db.error_type", type(e).__name__)
+
+                    if attempt >= MAX_RETRIES:
+                        EVENTS_FAILED_TOTAL.labels(reason=reason).inc()
+                        span.set_attribute("error", True)
+                        span.set_attribute("failure.reason", reason)
+
+                        await _send_to_dlq(dlq_producer, event, reason=reason)
+                        print(f"sent_to_dlq event_id={event.get('event_id')} reason={reason} attempts={attempt}")
+                        break
+
+                    attempt += 1
+                    EVENT_RETRIES_TOTAL.inc()
+                    backoff = min(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)), MAX_BACKOFF_SECONDS)
+                    await asyncio.sleep(backoff)
 
     finally:
         await consumer.stop()
