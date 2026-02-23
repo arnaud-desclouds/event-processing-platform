@@ -5,7 +5,13 @@ from typing import Any, Dict
 
 import asyncpg
 import structlog
-from tenacity import AsyncRetrying, RetryCallState, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from .observability import DB_RECONNECTS_TOTAL
 from .settings import Settings
@@ -24,7 +30,9 @@ def _on_db_connect_retry(log: structlog.stdlib.BoundLogger):
     return _hook
 
 
-async def connect_with_retries(settings: Settings, log: structlog.stdlib.BoundLogger) -> asyncpg.Connection:
+async def connect_with_retries(
+    settings: Settings, log: structlog.stdlib.BoundLogger
+) -> asyncpg.Connection:
     max_attempts = settings.db_connect_max_retries + 1
 
     retrying = AsyncRetrying(

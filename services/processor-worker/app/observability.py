@@ -15,7 +15,6 @@ from prometheus_client import Counter, Histogram, start_http_server
 
 from .settings import Settings
 
-
 EVENTS_PROCESSED_TOTAL = Counter(
     "events_processed_total",
     "Total number of events processed by the worker",

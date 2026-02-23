@@ -17,11 +17,11 @@ class ReadinessState:
 
 
 async def start_health_server(
-        *,
-        host: str,
-        port: int,
-        state: ReadinessState,
-        stop_event: asyncio.Event,
+    *,
+    host: str,
+    port: int,
+    state: ReadinessState,
+    stop_event: asyncio.Event,
 ) -> None:
     app = web.Application()
 

@@ -11,7 +11,6 @@ import pytest
 from aiokafka import AIOKafkaProducer
 from testcontainers.compose import DockerCompose
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -94,7 +93,9 @@ async def test_worker_inserts_event_end_to_end() -> None:
         while time.time() < deadline:
             conn = await asyncpg.connect(pg_dsn)
             try:
-                row = await conn.fetchrow("SELECT event_id, type, source FROM events WHERE event_id = $1", "it-1")
+                row = await conn.fetchrow(
+                    "SELECT event_id, type, source FROM events WHERE event_id = $1", "it-1"
+                )
                 if row is not None:
                     assert row["event_id"] == "it-1"
                     assert row["type"] == "integration_test"

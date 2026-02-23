@@ -10,7 +10,13 @@ import structlog
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
 from opentelemetry import propagate, trace
-from tenacity import AsyncRetrying, RetryCallState, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from . import db as db_mod
 from .health import ReadinessState
@@ -37,13 +43,17 @@ def _validate_event_shape(event: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-async def _send_to_dlq_wrapped(*, producer: AIOKafkaProducer, dlq_topic: str, event: Dict[str, Any], reason: str) -> None:
+async def _send_to_dlq_wrapped(
+    *, producer: AIOKafkaProducer, dlq_topic: str, event: Dict[str, Any], reason: str
+) -> None:
     dlq_event = {"failed_event": event, "failed_at": time.time(), "reason": reason}
     await producer.send_and_wait(dlq_topic, _encode(dlq_event))
     EVENTS_SENT_TO_DLQ_TOTAL.inc()
 
 
-async def _send_to_dlq_invalid_json(*, producer: AIOKafkaProducer, dlq_topic: str, raw_text: str) -> None:
+async def _send_to_dlq_invalid_json(
+    *, producer: AIOKafkaProducer, dlq_topic: str, raw_text: str
+) -> None:
     raw = {"raw": raw_text, "reason": "invalid_json"}
     await producer.send_and_wait(dlq_topic, _encode(raw))
     EVENTS_SENT_TO_DLQ_TOTAL.inc()
@@ -66,18 +76,20 @@ def _on_insert_retry(log: structlog.stdlib.BoundLogger, msg_fields: dict[str, An
     return _hook
 
 
-async def _insert_with_timeout(conn: asyncpg.Connection, event: Dict[str, Any], timeout: float) -> None:
+async def _insert_with_timeout(
+    conn: asyncpg.Connection, event: Dict[str, Any], timeout: float
+) -> None:
     await asyncio.wait_for(db_mod.insert_event(conn, event), timeout=timeout)
 
 
 async def run(
-        *,
-        settings: Settings,
-        consumer: AIOKafkaConsumer,
-        dlq_producer: AIOKafkaProducer,
-        stop_event: asyncio.Event,
-        log: structlog.stdlib.BoundLogger,
-        readiness: ReadinessState,
+    *,
+    settings: Settings,
+    consumer: AIOKafkaConsumer,
+    dlq_producer: AIOKafkaProducer,
+    stop_event: asyncio.Event,
+    log: structlog.stdlib.BoundLogger,
+    readiness: ReadinessState,
 ) -> None:
     tracer = trace.get_tracer(__name__)
     conn: Optional[asyncpg.Connection] = None
@@ -158,7 +170,9 @@ async def run(
                             reason=shape_reason,
                         )
                     except KafkaError:
-                        log.exception("dlq_publish_failed_missing_fields", **msg_fields, event_id=event_id)
+                        log.exception(
+                            "dlq_publish_failed_missing_fields", **msg_fields, event_id=event_id
+                        )
                         continue
 
                     await commit_message(consumer, msg)
@@ -172,9 +186,13 @@ async def run(
 
                 max_attempts = settings.max_retries + 1
                 retrying = AsyncRetrying(
-                    retry=retry_if_exception_type((asyncio.TimeoutError, asyncpg.PostgresError, OSError)),
+                    retry=retry_if_exception_type(
+                        (asyncio.TimeoutError, asyncpg.PostgresError, OSError)
+                    ),
                     stop=stop_after_attempt(max_attempts),
-                    wait=wait_exponential(multiplier=settings.base_backoff_seconds, max=settings.max_backoff_seconds),
+                    wait=wait_exponential(
+                        multiplier=settings.base_backoff_seconds, max=settings.max_backoff_seconds
+                    ),
                     reraise=True,
                     before_sleep=_on_insert_retry(log, msg_fields, event_id),
                 )
@@ -182,7 +200,9 @@ async def run(
                 try:
                     async for attempt in retrying:
                         with attempt:
-                            await _insert_with_timeout(conn, event, settings.db_write_timeout_seconds)
+                            await _insert_with_timeout(
+                                conn, event, settings.db_write_timeout_seconds
+                            )
                 except asyncio.TimeoutError:
                     reason = "db_timeout"
                 except (asyncpg.PostgresError, OSError) as exc:
@@ -201,7 +221,9 @@ async def run(
                         source=str(source or "unknown"),
                     ).inc()
                     EVENT_PROCESSING_DURATION_SECONDS.observe(time.perf_counter() - start)
-                    span.set_attribute("processing.duration_ms", (time.perf_counter() - start) * 1000.0)
+                    span.set_attribute(
+                        "processing.duration_ms", (time.perf_counter() - start) * 1000.0
+                    )
 
                     await commit_message(consumer, msg)
                     log.info(
@@ -225,7 +247,9 @@ async def run(
                         reason=reason,
                     )
                 except KafkaError:
-                    log.exception("dlq_publish_failed", **msg_fields, event_id=event_id, reason=reason)
+                    log.exception(
+                        "dlq_publish_failed", **msg_fields, event_id=event_id, reason=reason
+                    )
                     continue
 
                 await commit_message(consumer, msg)

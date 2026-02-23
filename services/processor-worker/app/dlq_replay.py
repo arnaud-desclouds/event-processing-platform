@@ -15,13 +15,19 @@ def _dumps(obj: Dict[str, Any]) -> bytes:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def _extract_failed_event(dlq_msg: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def _extract_failed_event(
+    dlq_msg: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Supports two DLQ formats:
     1) {"failed_event": {...}, "failed_at": ..., "reason": "..."}
     2) {"raw": "...", "reason": "..."}  (invalid_json case)
     """
-    if isinstance(dlq_msg, dict) and "failed_event" in dlq_msg and isinstance(dlq_msg["failed_event"], dict):
+    if (
+        isinstance(dlq_msg, dict)
+        and "failed_event" in dlq_msg
+        and isinstance(dlq_msg["failed_event"], dict)
+    ):
         return dlq_msg["failed_event"], dlq_msg.get("reason")
     return None, dlq_msg.get("reason") if isinstance(dlq_msg, dict) else None
 
@@ -103,13 +109,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-topic", default=os.getenv("EVENTS_TOPIC", "events.raw"))
 
     p.add_argument("--group-id", default="dlq-replay")
-    p.add_argument("--from-beginning", action="store_true", help="Consume DLQ from earliest offset.")
-    p.add_argument("--max-messages", type=int, default=0, help="Stop after N messages (0 = unlimited).")
+    p.add_argument(
+        "--from-beginning", action="store_true", help="Consume DLQ from earliest offset."
+    )
+    p.add_argument(
+        "--max-messages", type=int, default=0, help="Stop after N messages (0 = unlimited)."
+    )
 
     p.add_argument("--reason", default="", help="Only replay DLQ entries matching this reason.")
     p.add_argument("--event-id", default="", help="Only replay a specific event_id.")
 
-    p.add_argument("--dry-run", action="store_true", help="Do not publish, only print what would be replayed.")
+    p.add_argument(
+        "--dry-run", action="store_true", help="Do not publish, only print what would be replayed."
+    )
     p.add_argument(
         "--commit-offsets",
         action="store_true",

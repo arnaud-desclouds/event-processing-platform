@@ -5,14 +5,13 @@ from typing import Optional
 
 from aiokafka import AIOKafkaProducer
 from fastapi import FastAPI, Request, Response
-from pydantic import BaseModel
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
-
 from opentelemetry import propagate, trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from pydantic import BaseModel
 
 app = FastAPI()
 
@@ -120,7 +119,9 @@ async def ingest_event(event: Event):
         propagate.inject(carrier)
         headers = [(k, v.encode("utf-8")) for k, v in carrier.items()]
 
-        await producer.send_and_wait(TOPIC, json.dumps(event.model_dump()).encode(), headers=headers)
+        await producer.send_and_wait(
+            TOPIC, json.dumps(event.model_dump()).encode(), headers=headers
+        )
 
         EVENTS_INGESTED_TOTAL.labels(event_type=event.type, source=event.source).inc()
 
