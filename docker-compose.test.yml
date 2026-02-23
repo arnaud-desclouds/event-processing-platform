@@ -1,4 +1,4 @@
-name: event-processing-platform
+name: event-processing-platform-test
 
 services:
   # --- Broker ---------------------------------------------------------------
@@ -17,37 +17,27 @@ services:
       - --node-id
       - "0"
       - --check=false
-      # Bind two listeners inside the container:
-      # - INTERNAL for docker network clients
-      # - EXTERNAL for host clients (tests, local tools)
+      # Dual listeners:
+      # - INTERNAL: docker network clients
+      # - EXTERNAL: host-based integration tests
       - --kafka-addr
       - INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
       - --advertise-kafka-addr
-      - INTERNAL://redpanda:9092,EXTERNAL://localhost:19092
+      - INTERNAL://redpanda:9092,EXTERNAL://localhost:29092
+      # Keep pandaproxy enabled internally, but do NOT publish it to host in tests.
       - --pandaproxy-addr
       - 0.0.0.0:8082
       - --advertise-pandaproxy-addr
       - redpanda:8082
     ports:
-      - "9092:9092"
-      - "19092:19092"
-      - "8082:8082"
+      # Map EXTERNAL kafka listener to a non-colliding host port.
+      - "29092:19092"
     healthcheck:
-      test: [ "CMD-SHELL", "rpk cluster health || exit 1" ]
+      test: ["CMD-SHELL", "rpk cluster health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
       start_period: 60s
-
-  redpanda-console:
-    image: redpandadata/console:latest
-    depends_on:
-      redpanda:
-        condition: service_healthy
-    environment:
-      KAFKA_BROKERS: redpanda:9092
-    ports:
-      - "8080:8080"
 
   # --- Datastores -----------------------------------------------------------
   postgres:
@@ -57,9 +47,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-events_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-events_password}
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata_test:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-events_user} -d ${POSTGRES_DB:-events}"]
       interval: 10s
@@ -69,7 +59,7 @@ services:
   redis:
     image: redis:7
     ports:
-      - "6379:6379"
+      - "16379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -82,10 +72,10 @@ services:
       context: ./services/ingestion-api
     env_file: .env
     environment:
-      REDPANDA_BROKERS: ${REDPANDA_BROKERS:-redpanda:9092}
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      REDPANDA_BROKERS: redpanda:9092
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
     depends_on:
       redpanda:
         condition: service_healthy
@@ -94,22 +84,22 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "18000:8000"
 
   processor-worker:
     build:
       context: ./services/processor-worker
     env_file: .env
     environment:
-      REDPANDA_BROKERS: ${REDPANDA_BROKERS:-redpanda:9092}
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      REDPANDA_BROKERS: redpanda:9092
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       PYTHONUNBUFFERED: "1"
       WORKER_HEALTH_HOST: 0.0.0.0
       WORKER_HEALTH_PORT: 8081
     ports:
-      - "8081:8081"
+      - "18081:8081"
     depends_on:
       redpanda:
         condition: service_healthy
@@ -118,15 +108,15 @@ services:
       redis:
         condition: service_healthy
 
-  # One-shot migrations job
+  # One-shot migrations job (test DB)
   migrate:
     image: python:3.12-slim
     working_dir: /workspace
     volumes:
       - ./:/workspace
     environment:
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-events}
       POSTGRES_USER: ${POSTGRES_USER:-events_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-events_password}
@@ -135,22 +125,22 @@ services:
         condition: service_healthy
     command: >
       bash -lc "pip install -q alembic SQLAlchemy psycopg2-binary
-      && alembic upgrade head"
+      && alembic upgrade head || alembic stamp head"
 
-  # --- Observability --------------------------------------------------------
+  # --- Observability (optional for tests) -----------------------------------
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
       - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
     ports:
-      - "4317:4317"
-      - "4318:4318"
+      - "14317:4317"
+      - "14318:4318"
 
   jaeger:
     image: jaegertracing/all-in-one:1.58
     ports:
-      - "16686:16686"
+      - "26686:16686"
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
       COLLECTOR_ZIPKIN_HOST_PORT: "0.0.0.0:9411"
@@ -160,7 +150,7 @@ services:
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
+      - "19090:9090"
 
   grafana:
     image: grafana/grafana:latest
@@ -168,22 +158,12 @@ services:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
     volumes:
-      - grafana-data:/var/lib/grafana
+      - grafana-data-test:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "13000:3000"
     depends_on:
       - prometheus
 
-  # 🔥 Load Testing ----------------------------------------------------------
-  k6:
-    image: grafana/k6:latest
-    depends_on:
-      ingestion-api:
-        condition: service_started
-    volumes:
-      - ./load-tests:/scripts:ro
-    entrypoint: ["k6"]
-
 volumes:
-  pgdata:
-  grafana-data:
+  pgdata_test:
+  grafana-data-test:

@@ -1,3 +1,6 @@
 ruff
 pytest
 pytest-asyncio
+testcontainers
+mypy
+pyright

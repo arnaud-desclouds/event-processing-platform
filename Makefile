@@ -83,3 +83,13 @@ load-1k:
 
 clean:
 	docker compose down -v
+
+migrate:
+	docker compose run --rm migrate
+
+typecheck-worker:
+	python -m mypy services/processor-worker/app
+	python -m pyright services/processor-worker/app
+
+test-integration:
+	pytest -q tests/integration
