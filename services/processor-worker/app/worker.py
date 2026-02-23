@@ -4,6 +4,7 @@ import asyncio
 import json
 import signal
 from contextlib import suppress
+from typing import Any
 
 import asyncpg
 from aiokafka import AIOKafkaConsumer
@@ -12,15 +13,14 @@ from app.health import ReadinessState, start_health_server
 from app.observability import configure_logging, get_logger, setup_tracing, start_metrics_server
 from app.settings import Settings
 
-settings = Settings()
-_shutdown_event = asyncio.Event()
+SQL_INSERT_EVENT = "INSERT INTO events (event_id, type, source, payload) VALUES ($1, $2, $3, $4)"
 
 
-def _install_signal_handlers() -> None:
+def _install_signal_handlers(*, shutdown_event: asyncio.Event) -> None:
     """Handle SIGTERM/SIGINT for clean shutdown (Docker/Kubernetes correctness)."""
 
     def _handler() -> None:
-        _shutdown_event.set()
+        shutdown_event.set()
 
     loop = asyncio.get_running_loop()
 
@@ -31,15 +31,23 @@ def _install_signal_handlers() -> None:
         loop.add_signal_handler(signal.SIGINT, _handler)
 
 
-async def _process_event(pool: asyncpg.Pool, raw: bytes) -> None:
-    event = json.loads(raw.decode("utf-8"))
+def _parse_event(raw: bytes, log) -> dict[str, Any] | None:
+    try:
+        decoded = raw.decode("utf-8")
+        event = json.loads(decoded)
+        if not isinstance(event, dict):
+            log.warning("event_invalid_json", reason="not_an_object")
+            return None
+        return event
+    except Exception as exc:
+        log.warning("event_invalid_json", err_type=type(exc).__name__)
+        return None
 
+
+async def _insert_event(pool: asyncpg.Pool, event: dict[str, Any]) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO events (event_id, type, source, payload)
-            VALUES ($1, $2, $3, $4)
-            """,
+            SQL_INSERT_EVENT,
             event["event_id"],
             event["type"],
             event["source"],
@@ -47,8 +55,8 @@ async def _process_event(pool: asyncpg.Pool, raw: bytes) -> None:
         )
 
 
-async def run_worker() -> None:
-    _install_signal_handlers()
+async def run_worker(*, settings: Settings, shutdown_event: asyncio.Event) -> None:
+    _install_signal_handlers(shutdown_event=shutdown_event)
 
     configure_logging(settings.log_level)
     log = get_logger("processor-worker")
@@ -59,13 +67,13 @@ async def run_worker() -> None:
     # Start metrics as early as possible so boot failures are observable
     start_metrics_server(settings, log)
 
-    # Start health server concurrently; it will stop when _shutdown_event is set
+    # Start health server concurrently; it will stop when shutdown_event is set
     health_task = asyncio.create_task(
         start_health_server(
             host=settings.health_host,
             port=settings.health_port,
             state=readiness,
-            stop_event=_shutdown_event,
+            stop_event=shutdown_event,
         )
     )
 
@@ -110,25 +118,30 @@ async def run_worker() -> None:
 
         log.info("worker_started")
 
-        while not _shutdown_event.is_set():
+        while not shutdown_event.is_set():
             try:
                 msg = await asyncio.wait_for(consumer.getone(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
+            event = _parse_event(msg.value, log)
+            if event is None:
+                continue
+
             try:
-                await _process_event(pool, msg.value)
+                await _insert_event(pool, event)
             except Exception as exc:
-                # Don't crash the worker on a single bad message.
-                # (DLQ/retry can be added later without changing this boundary.)
-                log.exception("event_processing_failed", err_type=type(exc).__name__)
+                log.exception(
+                    "event_processing_failed",
+                    event_id=event.get("event_id"),
+                    err_type=type(exc).__name__,
+                )
 
     finally:
-        # Flip readiness early so load balancers stop sending traffic immediately.
         readiness.shutting_down = True
         readiness.kafka_ready = False
         readiness.db_ready = False
-        _shutdown_event.set()
+        shutdown_event.set()
 
         if consumer is not None:
             with suppress(Exception):
@@ -144,5 +157,11 @@ async def run_worker() -> None:
         log.info("worker_stopped_cleanly")
 
 
+def main() -> None:
+    settings = Settings()
+    shutdown_event = asyncio.Event()
+    asyncio.run(run_worker(settings=settings, shutdown_event=shutdown_event))
+
+
 if __name__ == "__main__":
-    asyncio.run(run_worker())
+    main()
