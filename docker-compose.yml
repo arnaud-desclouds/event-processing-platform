@@ -1,0 +1,153 @@
+name: event-processing-platform
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v26.1.5
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
+      - --check=false
+      # INTERNAL is for containers on the Compose network; EXTERNAL is for host tools.
+      - --kafka-addr
+      - INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - INTERNAL://redpanda:9092,EXTERNAL://localhost:19092
+      - --pandaproxy-addr
+      - 0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - redpanda:8082
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+      - "8082:8082"
+    healthcheck:
+      test: [ "CMD-SHELL", "rpk cluster health || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  redpanda-console:
+    image: redpandadata/console:v3.3.2
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+
+  postgres:
+    image: postgres:16.13
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-events}
+      POSTGRES_USER: ${POSTGRES_USER:-events_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-events_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-events_user} -d ${POSTGRES_DB:-events}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ingestion-api:
+    build:
+      context: .
+      dockerfile: services/ingestion_api/Dockerfile
+    env_file: .env
+    environment:
+      REDPANDA_BROKERS: ${REDPANDA_BROKERS:-redpanda:9092}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+  processor-worker:
+    build:
+      context: .
+      dockerfile: services/processor_worker/Dockerfile
+    env_file: .env
+    environment:
+      REDPANDA_BROKERS: ${REDPANDA_BROKERS:-redpanda:9092}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      PYTHONUNBUFFERED: "1"
+      WORKER_HEALTH_HOST: 0.0.0.0
+      WORKER_HEALTH_PORT: 8081
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  migrate:
+    build:
+      context: .
+      dockerfile: alembic/Dockerfile
+    profiles: ["manual"]
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-events}
+      POSTGRES_USER: ${POSTGRES_USER:-events_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-events_password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.150.1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    ports:
+      - "16686:16686"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      COLLECTOR_ZIPKIN_HOST_PORT: "0.0.0.0:9411"
+
+  prometheus:
+    image: prom/prometheus:v3.11.2
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  k6:
+    image: grafana/k6:1.6.1
+    depends_on:
+      ingestion-api:
+        condition: service_started
+    volumes:
+      - ./load-tests:/scripts:ro
+    entrypoint: ["k6"]
+
+volumes:
+  pgdata:

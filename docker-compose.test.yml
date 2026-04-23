@@ -1,0 +1,130 @@
+name: event-processing-platform-test
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v26.1.5
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
+      - --check=false
+      # INTERNAL is for containers; EXTERNAL is for host-based e2e tests.
+      - --kafka-addr
+      - INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - INTERNAL://redpanda:9092,EXTERNAL://localhost:29092
+      - --pandaproxy-addr
+      - 0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - redpanda:8082
+    ports:
+      - "29092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  postgres:
+    image: postgres:16.13
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-events}
+      POSTGRES_USER: ${POSTGRES_USER:-events_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-events_password}
+    ports:
+      - "15432:5432"
+    volumes:
+      - pgdata_test:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-events_user} -d ${POSTGRES_DB:-events}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ingestion-api:
+    build:
+      context: .
+      dockerfile: services/ingestion_api/Dockerfile
+    env_file: .env
+    environment:
+      REDPANDA_BROKERS: redpanda:9092
+      POSTGRES_HOST: postgres
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "18000:8000"
+
+  processor-worker:
+    build:
+      context: .
+      dockerfile: services/processor_worker/Dockerfile
+    env_file: .env
+    environment:
+      REDPANDA_BROKERS: redpanda:9092
+      POSTGRES_HOST: postgres
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      PYTHONUNBUFFERED: "1"
+      WORKER_HEALTH_HOST: 0.0.0.0
+      WORKER_HEALTH_PORT: 8081
+    ports:
+      - "18081:8081"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  migrate:
+    build:
+      context: .
+      dockerfile: alembic/Dockerfile
+    profiles: ["manual"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-events}
+      POSTGRES_USER: ${POSTGRES_USER:-events_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-events_password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.150.1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "14317:4317"
+      - "14318:4318"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    ports:
+      - "26686:16686"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      COLLECTOR_ZIPKIN_HOST_PORT: "0.0.0.0:9411"
+
+  prometheus:
+    image: prom/prometheus:v3.11.2
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "19090:9090"
+
+volumes:
+  pgdata_test:
